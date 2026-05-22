@@ -1,0 +1,240 @@
+name: lns-scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: >
+          扫描目标（支持4种格式）：
+          1. 单目标: https://example.com
+          2. 多目标（逗号分隔）: https://a.com,https://b.com
+          3. 文件路径: targets.txt（仓库根目录下的文件，每行一个目标）
+          4. URL下载列表: https://raw.githubusercontent.com/.../targets.txt
+        required: true
+        default: 'targets.txt'
+      parallel:
+        description: '并行扫描数量（默认 2，最多 5）'
+        required: false
+        default: '2'
+      shuffle:
+        description: '随机打乱目标顺序（默认 true）'
+        required: false
+        default: 'true'
+      timeout:
+        description: '每个目标超时分钟（默认 180）'
+        required: false
+        default: '180'
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # === 围栏配置 ===
+  GUARDRAILS_ENABLED: true
+  GUARDRAILS_MAX_SENSITIVE_RECORDS: 5
+
+  # === 漏洞报告配置 ===
+  VULN_REPORT_ENABLED: true
+  VULN_REPORT_FORMAT: markdown
+
+  # === 钉钉推送配置 ===
+  DINGTALK_ENABLED: true
+  DINGTALK_WEBHOOK: ${{ secrets.DING_WEBHOOK_URL }}
+  DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+  DINGTALK_STOP_ON_VULN: true
+
+  # === LLM 配置 ===
+  LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+
+jobs:
+  prepare:
+    name: 'Parse Targets'
+    runs-on: ubuntu-latest
+    outputs:
+      targets_json: ${{ steps.parse.outputs.targets_json }}
+      total: ${{ steps.parse.outputs.total }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Parse Targets
+        id: parse
+        run: |
+          INPUT='${{ github.event.inputs.target }}'
+          SHUFFLE='${{ github.event.inputs.shuffle }}'
+          TMP_FILE="/tmp/targets_raw.txt"
+
+          echo "========================================"
+          echo "  Target Parser"
+          echo "========================================"
+          echo "Input: $INPUT"
+          echo ""
+
+          # Mode 1: Remote URL list
+          if echo "$INPUT" | grep -qiE '^https?://.*\.(txt|list|csv)$'; then
+            echo "[Mode 1] Downloading remote list..."
+            curl -sL --max-time 30 "$INPUT" -o "$TMP_FILE" 2>/dev/null
+            if [ ! -s "$TMP_FILE" ]; then
+              echo "Download failed, treating as single target"
+              echo "$INPUT" > "$TMP_FILE"
+            fi
+          # Mode 2: Local file
+          elif echo "$INPUT" | grep -qiE '\.(txt|list|csv)$'; then
+            FILE="$(echo "$INPUT" | tr -d ' ')"
+            if [ -f "$FILE" ]; then
+              echo "[Mode 2] Reading local file: $FILE"
+              cp "$FILE" "$TMP_FILE"
+            else
+              echo "File not found: $FILE, treating as single target"
+              echo "$INPUT" > "$TMP_FILE"
+            fi
+          # Mode 3: Comma-separated
+          elif echo "$INPUT" | grep -q ','; then
+            echo "[Mode 3] Parsing comma-separated targets"
+            echo "$INPUT" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > "$TMP_FILE"
+          # Mode 4: Single target
+          else
+            echo "[Mode 4] Single target"
+            echo "$INPUT" > "$TMP_FILE"
+          fi
+
+          # Clean: dedup, trim, filter comments/blank lines
+          CLEAN_FILE="/tmp/targets_clean.txt"
+          grep -vE '^[[:space:]]*$|^[[:space:]]*#' "$TMP_FILE" | \
+            sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | \
+            sort -u > "$CLEAN_FILE"
+
+          TOTAL=$(wc -l < "$CLEAN_FILE" | tr -d ' ')
+          echo ""
+          echo "Total unique targets: $TOTAL"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "ERROR: No valid targets found!"
+            exit 1
+          fi
+
+          if [ "$SHUFFLE" = "true" ]; then
+            shuf "$CLEAN_FILE" > /tmp/targets_shuf.txt
+            mv /tmp/targets_shuf.txt "$CLEAN_FILE"
+            echo "Order: shuffled"
+          else
+            echo "Order: original"
+          fi
+
+          echo ""
+          echo "Target list:"
+          nl -w2 -s'. ' "$CLEAN_FILE" | head -20
+          [ "$TOTAL" -gt 20 ] && echo "  ... and $((TOTAL - 20)) more"
+
+          # Build JSON array for matrix
+          JSON=$(jq -R . "$CLEAN_FILE" | jq -s -c .)
+          echo "targets_json=$JSON" >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+          cp "$CLEAN_FILE" "$GITHUB_WORKSPACE/targets_parsed.txt"
+
+      - name: Upload Target List
+        uses: actions/upload-artifact@v4
+        with:
+          name: targets-list-${{ github.run_number }}
+          path: targets_parsed.txt
+          retention-days: 7
+
+  scan:
+    name: 'Scan ${{ matrix.target }}'
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout) }}
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(github.event.inputs.parallel) }}
+      matrix:
+        target: ${{ fromJSON(needs.prepare.outputs.targets_json) }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install -r requirements.txt --break-system-packages
+          pip install dirsearch --break-system-packages
+
+      - name: Build Knowledge Base
+        run: |
+          echo "========================================"
+          echo "  Building RAG Knowledge Base"
+          echo "========================================"
+          cd rag
+          python -m rag_kdprepare
+          cd ..
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Install Recon Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nmap curl wget jq 2>&1 | tail -3
+
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 2>/dev/null || true
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest 2>/dev/null || true
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/null || true
+          go install github.com/ffuf/ffuf/v2@latest 2>/dev/null || true
+
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Run Scan
+        id: scan
+        run: |
+          TARGET="${{ matrix.target }}"
+          SAFE_NAME=$(echo "$TARGET" | sed 's|[^a-zA-Z0-9._-]|_|g')
+          echo "========================================"
+          echo "  Target : $TARGET"
+          echo "  Task   : $SAFE_NAME"
+          echo "========================================"
+
+          python agent.py \
+            --goal "对 ${TARGET} 进行全面的 Web 安全测试，发现漏洞后立即停止" \
+            --task-name "${SAFE_NAME}" || true
+
+      - name: Collect Vulnerability Report
+        if: always()
+        run: |
+          echo "=== Scan Results ==="
+          # 匹配 .md 或 .markdown 后缀
+          REPORT=$(find logs/ -maxdepth 2 \( -name "vulnerability_report.md" -o -name "vulnerability_report.markdown" \) 2>/dev/null | head -1)
+          if [ -n "$REPORT" ]; then
+            echo "Found report: $REPORT"
+            echo "--- Report Preview ---"
+            cat "$REPORT" | head -100
+          else
+            echo "No vulnerability report generated"
+            # 列出 logs 目录内容帮助调试
+            find logs/ -maxdepth 3 -type f 2>/dev/null | head -20 || true
+          fi
+
+      - name: Upload Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vuln-reports-${{ github.run_id }}-${{ matrix.target }}
+          path: |
+            logs/**/vulnerability_report.*
+            logs/**/run_log.json
+            logs/**/metrics.json
+          if-no-files-found: ignore
+          retention-days: 7
